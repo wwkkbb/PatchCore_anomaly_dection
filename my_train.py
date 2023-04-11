@@ -17,6 +17,8 @@ from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 import faiss
 from sklearn.metrics import average_precision_score
+from sklearn.metrics import f1_score
+import copy
 
 def distance_matrix(x, y=None, p=2):  # pairwise distance of vectors
     y = x if type(y) == type(None) else y
@@ -106,6 +108,7 @@ def reshape_embedding(embedding):
                 embedding_list.append(embedding[k, :, i, j])
     return embedding_list
 
+
 def reshape_mask(masks):
     masks = masks.permute(0, 2, 3, 1)
     masks = (masks.cpu()).numpy()
@@ -116,13 +119,15 @@ def reshape_mask(masks):
     # cv2.imshow('x',masks_resize[0])
     # cv2.waitKey(0)
     return torch.tensor(masks_resize).permute(0, 3, 1, 2)
+
+
 # imagenet
 mean_train = [0.485, 0.456, 0.406]
 std_train = [0.229, 0.224, 0.225]
 
 
 class MVTecDataset(Dataset):
-    def __init__(self, root, root_mask,transform, gt_transform, phase):
+    def __init__(self, root, root_mask, transform, gt_transform, phase):
         if phase == 'train':
             self.img_path = os.path.join(root, 'train')
         else:
@@ -184,7 +189,7 @@ class MVTecDataset(Dataset):
 
         assert img.size()[1:] == gt.size()[1:], "image.size != gt.size !!!"
 
-        return img, gt, label, os.path.basename(img_path[:-4]), img_type,img_mask
+        return img, gt, label, os.path.basename(img_path[:-4]), img_type, img_mask
 
 
 def cvt2heatmap(gray):
@@ -304,20 +309,30 @@ class PatchCore(pl.LightningModule):
         self.init_results_list()
 
     def training_step(self, batch, batch_idx):  # save locally aware patch features
-        x, _, _, _, _ ,x_mask= batch
+        x, _, _, _, _, x_mask = batch
+        x_mask_1 = x_mask[:, 0, :, :]
+        index = torch.where(x_mask_1 > 0)
+        u = x[index[0], :, index[1], index[2]]
+        self.mean_RGB = torch.mean(u, dim=0)
+        index_0 = torch.where(x_mask_1 == 0)
+        x[index_0[0], :, index_0[1], index_0[2]] = self.mean_RGB
+        img_numpy = (x[0].cpu().numpy() + 2) * 40
+        # img_numpy=np.uint8(img_numpy.transpose(1, 2, 0))
+        # cv2.imshow("x",img_numpy)
+        # cv2.waitKey(0)
         features = self(x)
         embeddings = []
         for feature in features:
             m = torch.nn.AvgPool2d(3, 1, 1)
             embeddings.append(m(feature))
         embedding = embedding_concat(embeddings[0], embeddings[1])
-        temp=reshape_embedding(np.array(embedding))
-        x_mask = reshape_mask(x_mask)
-        temp_mask = reshape_embedding(np.array(x_mask))
-        temp_mask = np.array(temp_mask).T[0]
-        temp = temp * temp_mask[:, np.newaxis]
-        idx = np.where(temp_mask > 0)
-        self.embedding_list.extend(temp[idx])
+        temp = reshape_embedding(np.array(embedding))
+        # x_mask = reshape_mask(x_mask)
+        # temp_mask = reshape_embedding(np.array(x_mask))
+        # temp_mask = np.array(temp_mask).T[0]
+        # temp = temp * temp_mask[:, np.newaxis]
+        # idx = np.where(temp_mask > 0)
+        self.embedding_list.extend(temp)
 
     def training_epoch_end(self, outputs):
         total_embeddings = np.array(self.embedding_list)
@@ -339,7 +354,15 @@ class PatchCore(pl.LightningModule):
         faiss.write_index(self.index, os.path.join(self.embedding_dir_path, 'index.faiss'))
 
     def test_step(self, batch, batch_idx):  # Nearest Neighbour Search
-        x, gt, label, file_name, x_type ,x_mask= batch
+        x, gt, label, file_name, x_type, x_mask = batch
+
+        x_mask_1 = x_mask[:, 0, :, :]
+        index_0 = torch.where(x_mask_1 == 0)
+        x[index_0[0], :, index_0[1], index_0[2]] = self.mean_RGB
+        # img_numpy = (x[0].cpu().numpy() + 2) * 40
+        # img_numpy = np.uint8(img_numpy.transpose(1, 2, 0))
+        # cv2.imshow("x", img_numpy)
+        # cv2.waitKey(0)
         # extract embedding
         features = self(x)
         embeddings = []
@@ -354,8 +377,9 @@ class PatchCore(pl.LightningModule):
         w = (1 - (np.max(np.exp(N_b)) / np.sum(np.exp(N_b))))
         score = w * max(score_patches[:, 0])  # Image-level score
         gt_np = gt.cpu().numpy()[0, 0].astype(int)
-        anomaly_map_resized = cv2.resize(anomaly_map, (args.input_size, args.input_size)) * (
-            x_mask[0, 0, :, :].cpu().numpy())
+        anomaly_map_resized = cv2.resize(anomaly_map, (args.input_size, args.input_size))
+        # anomaly_map_resized = cv2.resize(anomaly_map, (args.input_size, args.input_size)) * (
+        #     x_mask[0, 0, :, :].cpu().numpy())
         anomaly_map_resized_blur = gaussian_filter(anomaly_map_resized, sigma=4)
         self.gt_list_px_lvl.extend(gt_np.ravel())
         self.pred_list_px_lvl.extend(anomaly_map_resized_blur.ravel())
@@ -374,16 +398,34 @@ class PatchCore(pl.LightningModule):
         print("Total image-level auc-roc score :")
         img_auc = roc_auc_score(self.gt_list_img_lvl, self.pred_list_img_lvl)
         print(img_auc)
-        print('test_epoch_end')
-        Ap_ = average_precision_score(self.gt_list_px_lvl, self.pred_list_px_lvl)
-        values = {'pixel_auc': pixel_auc, 'img_auc': img_auc, 'AP': Ap_}
-        print("AP:", average_precision_score(self.gt_list_px_lvl, self.pred_list_px_lvl))
+        # pred_list_px_lvl_01 = np.array((self.pred_list_px_lvl - min(self.pred_list_px_lvl)) / (
+        #             max(self.pred_list_px_lvl) - min(self.pred_list_px_lvl)))
+        pred_list_px_lvl_01 = (self.pred_list_px_lvl - min(self.pred_list_px_lvl)) / (
+                         max(self.pred_list_px_lvl) - min(self.pred_list_px_lvl))
+        Ap_ = average_precision_score(self.gt_list_px_lvl, pred_list_px_lvl_01)
+        print("AP:", Ap_)
+        f1_max = 0
+        n=10
+        pred_list_px_lvl_01=np.array(pred_list_px_lvl_01)
+        pred_list_px_lvl_01_const=copy.deepcopy(pred_list_px_lvl_01)
+        print(pred_list_px_lvl_01)
+        for i in range(0, n):
+            pred_list_px_index = pred_list_px_lvl_01_const > i / n
+            pred_list_px_lvl_01[pred_list_px_index] = 1
+            pred_list_px_lvl_01[~pred_list_px_index] = 0
+            f1 = f1_score(self.gt_list_px_lvl, pred_list_px_lvl_01)
+            if f1 > f1_max:
+                f1_max = f1
+            print('F1 score:' + str(i / n), f1)
+        values = {'pixel_auc': pixel_auc, 'img_auc': img_auc, 'AP': Ap_, 'F1 score:': f1_max}
         self.log_dict(values)
         file = open('/home/burly/my_train.txt', 'a')
         file.write(str({self.hparams['category']: values}))
         file.write('\n')
         # 关闭文件
         file.close()
+        print('test_epoch_end')
+
 
 def get_args():
     import argparse
@@ -403,9 +445,11 @@ def get_args():
     parser.add_argument('--n_neighbors', type=int, default=9)
     args = parser.parse_args()
     return args
+
+
 object_classnames = ['carpet', 'grid', 'leather', 'tile', 'wood']
-CLASS_NAMES =  [
-     'bottle','cable', 'capsule', 'carpet', 'grid', 'hazelnut', 'leather', 'metal_nut', 'pill', 'screw', 'tile',
+CLASS_NAMES = [
+    'bottle', 'cable', 'capsule', 'carpet', 'grid', 'hazelnut', 'leather', 'metal_nut', 'pill', 'screw', 'tile',
     'toothbrush', 'transistor', 'wood', 'zipper'
 ]
 
@@ -425,4 +469,3 @@ if __name__ == '__main__':
             trainer.test(model)
         elif args.phase == 'test':
             trainer.test(model)
-

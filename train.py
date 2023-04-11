@@ -17,7 +17,8 @@ from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
 import faiss
 from sklearn.metrics import average_precision_score
-
+from sklearn.metrics import f1_score
+import copy
 def distance_matrix(x, y=None, p=2):  # pairwise distance of vectors
     y = x if type(y) == type(None) else y
 
@@ -350,16 +351,33 @@ class PatchCore(pl.LightningModule):
         print("Total image-level auc-roc score :")
         img_auc = roc_auc_score(self.gt_list_img_lvl, self.pred_list_img_lvl)
         print(img_auc)
-        print('test_epoch_end')
-        Ap_ = average_precision_score(self.gt_list_px_lvl, self.pred_list_px_lvl)
-        values = {'pixel_auc': pixel_auc, 'img_auc': img_auc, 'AP': Ap_}
-        print("AP:", average_precision_score(self.gt_list_px_lvl, self.pred_list_px_lvl))
+        # pred_list_px_lvl_01 = np.array((self.pred_list_px_lvl - min(self.pred_list_px_lvl)) / (
+        #             max(self.pred_list_px_lvl) - min(self.pred_list_px_lvl)))
+        pred_list_px_lvl_01 = (self.pred_list_px_lvl - min(self.pred_list_px_lvl)) / (
+                max(self.pred_list_px_lvl) - min(self.pred_list_px_lvl))
+        Ap_ = average_precision_score(self.gt_list_px_lvl, pred_list_px_lvl_01)
+        print("AP:", Ap_)
+        f1_max = 0
+        n = 10
+        pred_list_px_lvl_01 = np.array(pred_list_px_lvl_01)
+        pred_list_px_lvl_01_const = copy.deepcopy(pred_list_px_lvl_01)
+        print(pred_list_px_lvl_01)
+        for i in range(0, n):
+            pred_list_px_index = pred_list_px_lvl_01_const > i / n
+            pred_list_px_lvl_01[pred_list_px_index] = 1
+            pred_list_px_lvl_01[~pred_list_px_index] = 0
+            f1 = f1_score(self.gt_list_px_lvl, pred_list_px_lvl_01)
+            if f1 > f1_max:
+                f1_max = f1
+            print('F1 score:' + str(i / n), f1)
+        values = {'pixel_auc': pixel_auc, 'img_auc': img_auc, 'AP': Ap_, 'F1 score:': f1_max}
         self.log_dict(values)
         file = open('/home/burly/train.txt', 'a')
         file.write(str({self.hparams['category']: values}))
         file.write('\n')
         # 关闭文件
         file.close()
+        print('test_epoch_end')
 
 
 def get_args():

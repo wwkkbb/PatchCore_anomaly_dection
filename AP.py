@@ -1,4 +1,4 @@
-path=r'/home/burly/train.txt'
+path=r'/home/burly/bigimg.txt'
 file = open(path, 'r')
 s=file.readlines()
 pixel_auc,img_auc,AP=0,0,0
